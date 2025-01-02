@@ -1,0 +1,214 @@
+#!/bin/sh
+
+# Verify root privileges
+if ! [ "$(id -u)" = 0 ]; then
+  echo "You must be root to run xconfig"
+  exit 1
+fi
+
+# Enable test mode for dry-run (set to 1 to enable, 0 to disable)
+TEST_MODE=0
+
+# Log file
+LOGFILE="/var/log/xconfig.log"
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
+}
+
+# Remove conflicting drivers
+remove_conflicting_drivers() {
+  log "Removing conflicting drivers..."
+  if [ "$TEST_MODE" -eq 1 ]; then
+    log "[TEST MODE] Would remove drivers from kld_list."
+  else
+    sysrc -f /etc/rc.conf kld_list-="amdgpu"
+    sysrc -f /etc/rc.conf kld_list-="radeonkms"
+    sysrc -f /etc/rc.conf kld_list-="nvidia"
+    sysrc -f /etc/rc.conf kld_list-="nvidia-modeset"
+    sysrc -f /etc/rc.conf kld_list-="nvidia-drm"
+    sysrc -f /etc/rc.conf kld_list-="i915kms"
+    kldunload amdgpu radeonkms nvidia nvidia-modeset nvidia-drm i915kms 2>/dev/null || true
+  fi
+}
+
+# Add NVIDIA DRM settings to /boot/loader.conf
+configure_loader_conf() {
+  if [ "$TEST_MODE" -eq 1 ]; then
+    log "[TEST MODE] Would add hw.nvidiadrm.modeset=1 to /boot/loader.conf."
+  else
+    if ! grep "hw.nvidiadrm.modeset=1" /boot/loader.conf >/dev/null 2>&1; then
+      echo "hw.nvidiadrm.modeset=1" >> /boot/loader.conf
+      log "Added hw.nvidiadrm.modeset=1 to /boot/loader.conf."
+    else
+      log "hw.nvidiadrm.modeset=1 already exists in /boot/loader.conf."
+    fi
+    if ! grep "linux_enable=\"YES\"" /etc/rc.conf >/dev/null 2>&1; then
+      sysrc linux_enable="YES"
+      log "Added linux_enable=YES to /etc/rc.conf."
+    else
+      log "linux_enable=YES already exists in /etc/rc.conf."
+    fi
+  fi
+}
+
+# Create Xorg configuration file
+create_xorg_conf() {
+  DRIVER=$1
+  log "Creating Xorg configuration for $DRIVER..."
+  if [ "$TEST_MODE" -eq 1 ]; then
+    log "[TEST MODE] Would create /etc/X11/xorg.conf with Driver $DRIVER."
+  else
+    mkdir -p /etc/X11
+    cat > /etc/X11/xorg.conf <<EOF
+Section "Device"
+    Identifier "Configured Video Device"
+    Driver "$DRIVER"
+EndSection
+EOF
+    log "Created /etc/X11/xorg.conf with Driver $DRIVER."
+  fi
+}
+
+# NVIDIA Driver Setup Function with Improved Reload Logic
+setup_nvidia() {
+  log "Setting up NVIDIA driver..."
+
+  if kldstat -v | grep nvidia-modeset >/dev/null; then
+    log "nvidia-modeset module is already loaded. Reloading it..."
+    if kldunload nvidia-modeset; then
+      log "Unloaded nvidia-modeset module successfully."
+    else
+      log "Failed to unload nvidia-modeset module. Continuing with current state."
+    fi
+  fi
+
+  if kldload nvidia-modeset; then
+    log "Loaded NVIDIA modeset driver successfully."
+    sysrc kld_list+="nvidia-modeset"
+    configure_loader_conf
+    create_xorg_conf "nvidia"
+  else
+    log "Failed to load NVIDIA modeset kernel module."
+    log "Ensure the NVIDIA driver is compatible and properly installed."
+    create_xorg_conf "nouveau"
+  fi
+}
+
+# AMD Driver Setup Function
+setup_amd() {
+  log "Setting up AMD driver..."
+  DRIVER="amdgpu"
+  if pciconf -lv | grep "class=0x030000"; then
+    DRIVER="radeonkms"
+  fi
+
+  if [ "$TEST_MODE" -eq 1 ]; then
+    log "[TEST MODE] Would load $DRIVER."
+  else
+    if kldload $DRIVER; then
+      log "Loaded AMD driver: $DRIVER."
+      sysrc kld_list+="$DRIVER"
+      create_xorg_conf "$DRIVER"
+    else
+      log "Failed to load AMD driver: $DRIVER."
+    fi
+  fi
+}
+
+# Intel Driver Setup Function
+setup_intel() {
+  log "Setting up Intel driver..."
+  DRIVER="i915kms"
+  if [ "$TEST_MODE" -eq 1 ]; then
+    log "[TEST MODE] Would load $DRIVER."
+  else
+    if kldload $DRIVER; then
+      log "Loaded Intel driver: $DRIVER."
+      sysrc kld_list+="$DRIVER"
+      create_xorg_conf "$DRIVER"
+    else
+      log "Failed to load Intel driver: $DRIVER."
+    fi
+  fi
+}
+
+# SCFB Fallback
+setup_scfb() {
+  log "Setting up SCFB fallback driver..."
+  if [ "$TEST_MODE" -eq 1 ]; then
+    log "[TEST MODE] Would configure SCFB driver."
+  else
+    mkdir -p /etc/X11
+    if cp /usr/local/etc/X11/cardDetect/XF86Config.scfb /etc/X11/xorg.conf; then
+      log "Configured SCFB driver."
+    else
+      log "Failed to configure SCFB driver."
+    fi
+  fi
+}
+
+# Auto-Detection Function
+auto_detect() {
+  log "Attempting auto-detection of GPU..."
+  remove_conflicting_drivers
+  if pciconf -lv | grep NVIDIA; then
+    setup_nvidia
+  elif pciconf -lv | grep "AMD/ATI"; then
+    setup_amd
+  elif pciconf -lv | grep Intel; then
+    setup_intel
+  else
+    log "No compatible GPU detected. Falling back to SCFB."
+    setup_scfb
+  fi
+}
+
+# Cleanup Function
+cleanup() {
+  log "Performing cleanup operations..."
+  remove_conflicting_drivers
+}
+
+# Manual Setup Menu
+manual_setup() {
+  dialog --title "X Configuration Menu" \
+    --menu "Please select from the following options:" 20 70 12 \
+    auto "Automatic detection and setup" \
+    drm_intel "Start Desktop with Intel DRM driver" \
+    amdgpu "Start Desktop with AMD GPU driver" \
+    radeonkms "Start Desktop with Radeon KMS driver" \
+    nvidia_modeset "Start Desktop with NVIDIA modeset driver" \
+    scfb "Start Desktop with SCFB driver" \
+    shell "Drop to emergency shell" \
+    reboot "Reboot the system" \
+    exit "Exit X Configuration" 2>/tmp/answer
+
+  case $(cat /tmp/answer) in
+    auto) auto_detect ;;
+    drm_intel) setup_intel ;;
+    amdgpu) setup_amd ;;
+    radeonkms) DRIVER="radeonkms"; kldload $DRIVER; log "Loaded $DRIVER." ;;
+    nvidia_modeset) setup_nvidia ;;
+    scfb) setup_scfb ;;
+    shell) log "Dropping to emergency shell."; /bin/sh ;;
+    reboot) log "Rebooting system..."; reboot ;;
+    exit) log "Exiting X Configuration."; exit 0 ;;
+    *) log "Invalid selection." ;;
+  esac
+}
+
+# Main Execution
+if [ "$#" -eq 0 ]; then
+  manual_setup
+else
+  case $1 in
+    auto) auto_detect ;;
+    cleanup) cleanup ;;
+    intel) setup_intel ;;
+    amd) setup_amd ;;
+    nvidia) setup_nvidia ;;
+    scfb) setup_scfb ;;
+    *) echo "Usage: $0 {auto|cleanup|intel|amd|nvidia|scfb}"; exit 1 ;;
+  esac
+fi
+
