@@ -1,6 +1,6 @@
 # XConfig (Prototype)
 
-XConfig is a shell script designed to simplify GPU driver setup and configuration on FreeBSD. It supports automatic detection of installed GPUs and provides a manual setup option for custom configurations.
+XConfig is a shell script designed to simplify GPU driver setup and configuration on FreeBSD and GhostBSD. It supports automatic detection of installed GPUs and provides a manual setup option for custom configurations.
 
 ## Features
 - Automatic detection and configuration of GPU drivers.
